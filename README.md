@@ -1,4 +1,6 @@
-# Markov Desk — HMM × LLM Trading Bot for Bybit
+# Markov Desk
+
+![Markov Desk Dashboard](screenshot.png) — HMM × LLM Trading Bot for Bybit
 
 Algorithmic paper-trading bot combining **Hidden Markov Models** (Baum-Welch + Viterbi, based on Andersson & Fransson 2016, University of Gothenburg) with an **LLM decision overlay** that learns from past trades via memory + reflection.
 
