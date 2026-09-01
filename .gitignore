@@ -1,0 +1,38 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# next.js
+.next/
+/out/
+
+# production
+/build
+
+# env files (may contain secrets)
+.env
+.env.local
+.env.*.local
+
+# database
+db/*.db
+db/*.db-journal
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# misc
+.DS_Store
+*.pem
+*.tsbuildinfo
+next-env.d.ts
+
+# IDE
+.vscode/
+.idea/
+
+# os
+Thumbs.db

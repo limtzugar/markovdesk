@@ -1,0 +1,181 @@
+// Prisma schema for Markov Desk — HMM × LLM trading bot on Bybit
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Single-row table holding the active bot configuration & runtime state.
+model BotState {
+  id        String   @id @default("singleton")
+  symbols   String   @default("BTCUSDT,ETHUSDT,SOLUSDT,BTCSOL") // comma-separated portfolio
+  interval  String   @default("60") // Bybit kline interval in minutes (60 = 1h)
+  mode      String   @default("STATIC") // STATIC | DYNAMIC
+  running   Boolean  @default(false)
+  capital   Float    @default(1000) // starting paper capital
+  positionSizePct Float @default(0.1) // fraction of equity per trade
+  stopLossPct Float  @default(0.03) // hard stop loss
+  maxDrawdownPct Float @default(0.15)
+  leverage  Float    @default(1)
+  trainingWindow Int @default(200) // L — number of klines used to train HMM
+  predictLength Int  @default(1) // l — dynamic retrain cadence
+  deltaPct  Float    @default(0.0015) // ∆ — dead-zone threshold for observable states
+  llmEnabled Boolean @default(true)
+  llmWeight Float    @default(0.35) // how much LLM can override HMM signal
+  llmProvider String @default("glm") // glm | deepseek | openai
+  llmModel  String   @default("") // optional model override (e.g. deepseek-chat, deepseek-reasoner)
+  reflectionInterval Int @default(10) // run reflection every N closed trades
+  memoryTopK Int     @default(5) // how many similar past trades to inject
+  lastTrainedAt DateTime?
+  lastSignalAt DateTime?
+  lastReflectionAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// A single completed or open paper trade.
+model Trade {
+  id        String   @id @default(cuid())
+  symbol    String
+  side      String   // LONG | SHORT
+  size      Float    // base asset size
+  entryPrice Float
+  exitPrice Float?
+  entryAt   DateTime @default(now())
+  exitAt    DateTime?
+  status    String   @default("OPEN") // OPEN | CLOSED | LIQUIDATED
+  pnl       Float?
+  pnlPct    Float?
+  hmmSignal String   // RISE | DROP
+  hmmProb   Float    // Viterbi posterior proxy
+  llmAction String?  // AGREE | OVERRIDE_LONG | OVERRIDE_SHORT | HOLD | STRONG_AGREE
+  llmConfidence Float?
+  reason    String?
+  closedReason String? // TARGET | STOP | SIGNAL_FLIP | MANUAL
+  /// Snapshot of market features at entry — used for memory similarity search.
+  features  String?  // JSON {rsi, atrPct, maSpread, funding, pct24h, hmmProb, obs}
+  memoryIds String?  // JSON array of TradeMemory IDs consulted at decision time
+  strategyVersion Int @default(1)
+}
+
+/// Most-recently trained HMM parameters, snapshot per training run.
+model HMMModel {
+  id        String   @id @default(cuid())
+  symbol    String
+  interval  String
+  mode      String
+  trainedAt DateTime @default(now())
+  transition String // JSON [[a11,a12],[a21,a22]]
+  emission  String  // JSON [NxM]
+  pi        String  // JSON [1xN]
+  logLikelihood Float
+  trainingSize Int
+  sequenceHash String?
+}
+
+/// Reasoning stream from LLM — one record per signal cycle.
+model LLMReasoning {
+  id        String   @id @default(cuid())
+  symbol    String
+  createdAt DateTime @default(now())
+  hmmSignal String
+  hmmProb   Float
+  llmAction String
+  llmConfidence Float
+  reasoning String
+  marketSummary String
+  candlesDigest String
+  /// IDs of memory entries consulted — provenance chain.
+  memoryUsed String? // JSON array of TradeMemory IDs
+  strategyVersion Int @default(1)
+}
+
+/// Vector-ish trade memory — one row per closed trade, with a feature
+/// signature used for similarity search. This is the LLM's "long-term
+/// memory of what worked and what didn't".
+model TradeMemory {
+  id        String   @id @default(cuid())
+  tradeId   String   // FK to Trade.id
+  symbol    String
+  side      String   // LONG | SHORT
+  entryAt   DateTime
+  exitAt    DateTime
+  pnl       Float
+  pnlPct    Float
+  outcome   String   // WIN | LOSS | BREAKEVEN
+  closedReason String?
+
+  /// Feature signature — used for cosine-similarity search in SQLite.
+  /// Dimensions: [rsi/100, atrPct/5, maSpread/10, funding*100, pct24h/10,
+  ///              hmmProb, side_long(0/1), obs_idx/9]
+  /// Stored as JSON array of numbers, normalized to [0,1].
+  signature String  // JSON array
+
+  /// Human-readable digest injected into LLM prompt.
+  digest    String  // e.g. "BTCUSDT LONG @ $62k, RSI 38, ATR 1.2%, MA10<MA50, HMM RISE p=0.78 → +1.2% WIN (signal-flip)"
+
+  /// Tags for quick filtering.
+  tags      String? // JSON array: ["oversold", "trend-down", "hmm-strong"]
+  createdAt DateTime @default(now())
+
+  @@index([symbol])
+  @@index([outcome])
+}
+
+/// LLM-generated strategy lesson — emitted by the reflection loop.
+/// Each lesson is a structured insight the bot should remember.
+model StrategyNote {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  symbol    String?  // null = applies to all symbols
+  category  String   // PATTERN | RISK | TIMING | OVERRIDE | CONFIRMATION
+  severity  String   // INFO | WARNING | CRITICAL
+  lesson    String   // the actual lesson text
+  evidence  String?  // JSON array of trade IDs supporting the lesson
+  suggestedAction String? // e.g. "reduce position size when RSI>70 and funding>0.05%"
+  applied   Boolean  @default(false) // has the bot started using this?
+  confidence Float   @default(0.5)
+  /// Stats updated as more trades confirm/refute this lesson.
+  confirmations Int  @default(0)
+  refutations Int    @default(0)
+  strategyVersion Int @default(1)
+}
+
+/// Reflection session log — one row per reflection run.
+model Reflection {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  symbol    String?  // null = portfolio-wide
+  tradesReviewed Int
+  winsReviewed   Int
+  lossesReviewed Int
+  netPnl    Float
+  /// LLM output: lessons learned + suggested adjustments.
+  summary   String
+  lessonsGenerated Int @default(0)
+  notesJson String? // JSON array of StrategyNote IDs created
+  rawResponse String? // full LLM response for audit
+}
+
+/// Backtest run result.
+model Backtest {
+  id        String   @id @default(cuid())
+  symbol    String
+  interval  String
+  mode      String
+  startedAt DateTime @default(now())
+  finishedAt DateTime?
+  fromTs    DateTime
+  toTs      DateTime
+  startCapital Float
+  endCapital Float?
+  totalTrades Int?
+  winRate   Float?
+  sharpe    Float?
+  maxDrawdown Float?
+  equityCurve String? // JSON [{t, equity}]
+}
